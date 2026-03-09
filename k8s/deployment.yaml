@@ -1,0 +1,88 @@
+# Demonstrates the initContainer migration pattern with pg_advisory_lock.
+#
+# With replicas: 3, all three pods start their initContainers simultaneously.
+# Each initContainer runs migrate.py which:
+#   1. Calls pg_advisory_lock() — blocks until it can acquire
+#   2. Runs "alembic upgrade head"
+#   3. Releases the lock
+#
+# The first pod to acquire the lock runs the actual migrations. The other two
+# wait, then acquire the lock in turn, see the schema already at head, and
+# Alembic no-ops. All three exit 0. Their main containers then start normally.
+#
+# On rolling update: new pods run new migrations in their initContainers before
+# old pods terminate — same image guarantees schema and code are always in sync.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: migration-demo
+  namespace: migration-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: migration-demo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: migration-demo
+    spec:
+      initContainers:
+        - name: db-migrate
+          image: migration-demo:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.migrate"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: migration-demo-db
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      containers:
+        - name: app
+          # Same image as the initContainer — schema version and app code
+          # are always in sync. No version skew between migration runner
+          # and the application that depends on the schema.
+          image: migration-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: migration-demo-db
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
